@@ -14,6 +14,7 @@ from .cursor import decode_cursor, encode_cursor
 from .db import read_tx, write_tx
 from .schemas import (
     EffectiveEvent,
+    EventBatchIn,
     EventIn,
     EventOut,
     LeaderboardChangeOut,
@@ -38,6 +39,12 @@ def _row_to_event(row: sqlite3.Row) -> EventOut:
         correction_of=row["correction_of"],
         revision=row["revision"],
         created_at=row["created_at"],
+    )
+
+
+def _utc_now() -> str:
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     )
 
 
@@ -80,9 +87,7 @@ def create_event(ev: EventIn) -> Tuple[EventOut, bool]:
         revision = conn.execute(
             "SELECT COALESCE(MAX(revision), 0) + 1 FROM events"
         ).fetchone()[0]
-        created_at = (
-            datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-        )
+        created_at = _utc_now()
         conn.execute(
             "INSERT INTO events (event_id, participant_id, points, correction_of, payload, revision, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -100,6 +105,156 @@ def create_event(ev: EventIn) -> Tuple[EventOut, bool]:
             "SELECT * FROM events WHERE event_id = ?", (ev.event_id,)
         ).fetchone()
         return _row_to_event(row), True
+
+
+def create_events(batch: EventBatchIn) -> Tuple[list[EventOut], bool]:
+    """Atomically insert a batch of 1–100 immutable events.
+
+    Revisions are assigned as one contiguous block, in request order:
+    the first new event gets ``MAX(revision) + 1`` and so on. Validation
+    and insertion all happen in a single ``BEGIN IMMEDIATE`` transaction,
+    so any failure rolls the whole batch back — no event is stored and no
+    revision number is consumed.
+
+    ``correction_of`` may reference an event already stored in the ledger
+    or an event appearing *earlier* in the same batch; referencing a later
+    item (or an unknown id) fails with 422.
+
+    Returns (events, created) with ``events`` in request order:
+      * none of the ids existed -> insert all, created=True  (HTTP 201)
+      * every id existed with an identical payload -> replay the stored
+        events in request order, created=False                    (HTTP 200)
+      * some but not all ids existed, or any existing id carries a
+        different payload -> 409 Conflict
+    """
+    events = batch.root
+
+    # Cheap self-checks; the schema normally rejects these before the call.
+    if not events:
+        raise HTTPException(status_code=422, detail="batch must contain 1–100 events")
+    if len(events) > 100:
+        raise HTTPException(status_code=422, detail="batch must contain 1–100 events")
+    seen_ids: set[str] = set()
+    for ev in events:
+        if ev.event_id in seen_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=f"event_id '{ev.event_id}' appears more than once in the batch",
+            )
+        seen_ids.add(ev.event_id)
+        if ev.correction_of is not None and ev.correction_of == ev.event_id:
+            raise HTTPException(
+                status_code=422, detail="correction_of must not equal event_id"
+            )
+
+    payloads = [_canonical_payload(ev) for ev in events]
+    index_by_id = {ev.event_id: i for i, ev in enumerate(events)}
+    created_at = _utc_now()
+
+    with write_tx() as conn:
+        rows = conn.execute(
+            "SELECT event_id, payload FROM events"
+            " WHERE event_id IN (%s)" % ",".join("?" for _ in events),
+            [ev.event_id for ev in events],
+        ).fetchall()
+        stored = {row["event_id"]: row["payload"] for row in rows}
+
+        if stored:
+            # Conflict detection first: a same-id/different-payload clash is a
+            # 409 even when an invalid reference is also present.
+            for ev, payload in zip(events, payloads):
+                if ev.event_id in stored and stored[ev.event_id] != payload:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"event_id '{ev.event_id}' already exists "
+                            "with a different payload"
+                        ),
+                    )
+            if len(stored) < len(events):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"batch is a partial replay: {len(stored)} of {len(events)} "
+                        "events already exist; resend with the full original set "
+                        "or only new event_ids"
+                    ),
+                )
+
+        if len(stored) == len(events):
+            # Full idempotent replay: return stored events in request order.
+            rows_by_id = {
+                row["event_id"]: row
+                for row in conn.execute(
+                    "SELECT * FROM events WHERE event_id IN (%s)"
+                    % ",".join("?" for _ in events),
+                    [ev.event_id for ev in events],
+                ).fetchall()
+            }
+            return [_row_to_event(rows_by_id[ev.event_id]) for ev in events], False
+
+        # All new: validate every reference first (against the ledger and
+        # against earlier batch items), then insert as one contiguous
+        # revision block in request order.
+        for i, ev in enumerate(events):
+            if ev.correction_of is None:
+                continue
+            target_idx = index_by_id.get(ev.correction_of)
+            if target_idx is not None:
+                if target_idx >= i:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"event '{ev.event_id}' has correction_of "
+                            f"'{ev.correction_of}' referencing a later event "
+                            "in the same batch; only earlier events may be "
+                            "referenced"
+                        ),
+                    )
+            else:
+                target = conn.execute(
+                    "SELECT 1 FROM events WHERE event_id = ?",
+                    (ev.correction_of,),
+                ).fetchone()
+                if target is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "correction_of references unknown event "
+                            f"'{ev.correction_of}'"
+                        ),
+                    )
+
+        next_revision = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM events"
+        ).fetchone()[0]
+        results: list[EventOut] = []
+        for i, ev in enumerate(events):
+            revision = next_revision + i
+            conn.execute(
+                "INSERT INTO events (event_id, participant_id, points, correction_of, payload, revision, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ev.event_id,
+                    ev.participant_id,
+                    ev.points,
+                    ev.correction_of,
+                    payloads[i],
+                    revision,
+                    created_at,
+                ),
+            )
+            results.append(
+                EventOut(
+                    event_id=ev.event_id,
+                    participant_id=ev.participant_id,
+                    points=ev.points,
+                    correction_of=ev.correction_of,
+                    revision=revision,
+                    created_at=created_at,
+                )
+            )
+        return results, True
 
 
 def get_event(event_id: str) -> EventOut:

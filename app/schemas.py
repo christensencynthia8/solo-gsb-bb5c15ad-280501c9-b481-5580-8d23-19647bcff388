@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel, model_validator
 
 
 class EventIn(BaseModel):
@@ -16,6 +16,27 @@ class EventIn(BaseModel):
         description="event_id of an existing event this event corrects; "
         "corrections may themselves be corrected (chain).",
     )
+
+
+class EventBatchIn(RootModel[List[EventIn]]):
+    """Write model for ``POST /events/batch``: 1–100 events, unique event_ids."""
+
+    root: List[EventIn] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def _unique_event_ids(self) -> "EventBatchIn":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for ev in self.root:
+            if ev.event_id in seen and ev.event_id not in duplicates:
+                duplicates.append(ev.event_id)
+            seen.add(ev.event_id)
+        if duplicates:
+            raise ValueError(
+                "event_id values must be unique within the batch; "
+                f"duplicates: {duplicates}"
+            )
+        return self
 
 
 class EventOut(BaseModel):
