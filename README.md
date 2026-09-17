@@ -4,6 +4,7 @@
 
 - **不可变事件**：积分以事件形式追加写入，写后不可改。
 - **幂等写入**：每个 `event_id` 只生效一次；相同载荷重放返回原结果（200），相同 `event_id` 不同载荷返回 **409**。
+- **原子批量写入**：`POST /events/batch` 一次接收 1～100 个事件，在同一事务内按数组顺序分配连续 revision；整批成功或整批回滚，支持批量幂等重放。
 - **更正链**：更正事件通过 `correction_of` 引用已有事件，更正本身可被再次更正（链式）。任一 revision 上，每条更正链只计**当时的末端事件**。
 - **递增 revision**：每次成功写入获得严格递增的 revision；可查询当前或任一历史 revision 的排行榜与生效明细。
 - **并发安全**：写入经 `BEGIN IMMEDIATE` 串行化，revision 在写锁内分配——并发写入不会产生重复 revision 或中间态。
@@ -55,6 +56,46 @@ curl -X POST localhost:8000/events -H 'Content-Type: application/json' -d \
 ```
 
 链 `e1 → e2 → e3` 中：revision ≥ e3 时只有 `e3` 计入；在 e3 写入之前、e2 写入之后，只有 `e2` 计入。
+
+### 原子批量写入 `POST /events/batch`
+
+一次提交 **1～100** 个事件（超过或为空均 `422`）。所有校验与写入在**同一个 `BEGIN IMMEDIATE` 事务**内完成，按数组顺序分配连续 revision；任一事件校验或写入失败，整批回滚——不留下任何事件，也不消耗 revision。
+
+- 批内 `event_id` 必须唯一，重复返回 `422`；
+- `correction_of` 可引用**库中已有事件**或**本批更早（数组位置更靠前）的事件**；引用本批后续项或未知事件返回 `422`；自引用同样 `422`。
+
+```bash
+curl -X POST localhost:8000/events/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"event_id": "m1", "participant_id": "alice", "points": 10},
+      {"event_id": "m2", "participant_id": "alice", "points": 12, "correction_of": "m1"},
+      {"event_id": "m3", "participant_id": "bob",   "points": 5}
+    ]
+  }'
+```
+
+上例中 `m1/m2/m3` 分别获得连续 revision（如 `5/6/7`），`m2` 对同批更早的 `m1` 的更正与普通更正链规则一致。响应为数组，**顺序与请求一致**：
+
+```json
+[
+  {"event_id": "m1", "participant_id": "alice", "points": 10, "correction_of": null, "revision": 5, "created_at": "2026-09-17T08:00:00.000Z"},
+  {"event_id": "m2", "participant_id": "alice", "points": 12, "correction_of": "m1", "revision": 6, "created_at": "2026-09-17T08:00:00.000Z"},
+  {"event_id": "m3", "participant_id": "bob",   "points": 5,  "correction_of": null, "revision": 7, "created_at": "2026-09-17T08:00:00.000Z"}
+]
+```
+
+| 场景 | 状态码 | 说明 |
+|---|---|---|
+| 批内全部为新事件且校验通过 | `201` | 整批落库，按请求顺序返回结果与连续 revision |
+| 全部 `event_id` 均已存在且载荷逐项一致（可任意排列顺序重放） | `200` | 按本次请求顺序返回**原结果**，不产生新 revision |
+| 部分已存在、部分为新事件 | `409` | 整批拒绝，不写入任何新事件 |
+| 任一已存在 `event_id` 的载荷不一致 | `409` | 整批拒绝 |
+| 空批 / 超过 100 个 / 批内 `event_id` 重复 | `422` | 载荷校验失败 |
+| `correction_of` 引用未知事件、本批后续项或自引用 | `422` | 非法引用，整批回滚 |
+
+> 幂等判定与单事件接口一致：载荷按规范化 JSON（键名排序）比对，请求中键的先后顺序不影响结果。批量重放时仅当**全部**事件均已存在且逐项一致才返回 200；哪怕只有一个新 `event_id`，也按 `409` 处理，避免半批已存在时的歧义。
 
 ### 排行榜 `GET /leaderboard`
 
@@ -221,12 +262,12 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），以及 `/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序）。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），以及 `/events/batch`（连续 revision 与响应顺序、批内去重/越界、引用同批更早项与库中事件、引用后续项/未知事件/自引用回滚、全量重放 200、部分存在与异载荷 409、批与单事件并发下 revision 不重不漏）。
 
 ## 设计要点
 
 - **存储**：单表 `events`（`event_id` 主键，`revision` 唯一），WAL 模式。
-- **幂等**：请求载荷序列化为规范化 JSON（键排序）随事件存储；重放时比对，一致返回原结果，不一致返回 409。
+- **幂等**：请求载荷序列化为规范化 JSON（键排序）随事件存储；重放时比对，一致返回原结果，不一致返回 409。批量接口在一个事务内读入批内全部 `event_id`：全不存在才插入，全部存在且载荷一致才按请求顺序回放原结果（200），其余情况（部分存在或任一异载荷）一律 409 并回滚。
 - **生效判定**：revision R 上事件 e 生效 ⟺ `e.revision ≤ R` 且不存在 `c.revision ≤ R` 的更正事件 `c.correction_of = e.event_id`。
-- **并发**：所有写操作在 `BEGIN IMMEDIATE` 事务内先取写锁、再计算 `MAX(revision)+1` 并插入，配合 `busy_timeout`，写者完全串行；读者走 WAL 快照，互不阻塞。
+- **并发**：所有写操作（含 `/events/batch`）在 `BEGIN IMMEDIATE` 事务内先取写锁、再计算 `MAX(revision)+1` 并插入，配合 `busy_timeout`，写者完全串行；批量写入在锁内按数组顺序逐条分配连续 revision，与单事件写入并发也不会产生重复/空洞 revision。读者走 WAL 快照，互不阻塞。
 - **游标分页**：`/leaderboard/page` 的游标经 HMAC-SHA256 签名（密钥来自 `LEADERBOARD_CURSOR_SECRET`），绑定 revision 与末条排序键 `(total_points, participant_id)`；续读始终落在游标指定的 revision 上，配合 WAL 快照读，写入并发进行也不会造成分页漂移。

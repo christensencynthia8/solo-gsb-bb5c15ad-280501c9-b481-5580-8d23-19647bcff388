@@ -18,6 +18,21 @@ class EventIn(BaseModel):
     )
 
 
+class EventBatchIn(BaseModel):
+    """Write model for an atomic batch of 1–100 points events."""
+
+    events: List[EventIn] = Field(
+        min_length=1,
+        max_length=100,
+        description=(
+            "Events to write atomically; contiguous revisions are allocated "
+            "in array order. event_id values must be unique within the batch, "
+            "and correction_of may reference a stored event or an earlier "
+            "event in the same batch."
+        ),
+    )
+
+
 class EventOut(BaseModel):
     event_id: str
     participant_id: str

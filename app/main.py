@@ -8,6 +8,7 @@ from fastapi import FastAPI, Query, Response, status
 from . import ledger
 from .db import init_db
 from .schemas import (
+    EventBatchIn,
     EventIn,
     EventOut,
     LeaderboardChangesOut,
@@ -53,6 +54,38 @@ def post_event(ev: EventIn, response: Response) -> EventOut:
     if not created:
         response.status_code = status.HTTP_200_OK
     return event
+
+
+@app.post(
+    "/events/batch",
+    response_model=List[EventOut],
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        200: {
+            "description": (
+                "Idempotent replay: every event_id already stored with an "
+                "identical payload; original results returned in request order"
+            )
+        },
+        409: {
+            "description": (
+                "Some event_ids are missing while others are stored, or an "
+                "event_id already exists with a different payload"
+            )
+        },
+        422: {
+            "description": (
+                "Empty/oversized batch, duplicated event_id within the batch, "
+                "or an invalid correction_of reference (unknown or later event)"
+            )
+        },
+    },
+)
+def post_events_batch(batch: EventBatchIn, response: Response) -> List[EventOut]:
+    events, created = ledger.create_events_batch(batch.events)
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return events
 
 
 @app.get("/events", response_model=List[EventOut])

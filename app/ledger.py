@@ -41,6 +41,153 @@ def _row_to_event(row: sqlite3.Row) -> EventOut:
     )
 
 
+def _validate_batch_shape(events: list[EventIn]) -> None:
+    """Batch-internal checks independent of database state.
+
+    Duplicate ``event_id`` inside the batch and correction self-references
+    are request-shape errors (422), not conflicts with stored data.
+    """
+    seen: set[str] = set()
+    for ev in events:
+        if ev.event_id in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=f"event_id '{ev.event_id}' is duplicated within the batch",
+            )
+        seen.add(ev.event_id)
+        if ev.correction_of is not None and ev.correction_of == ev.event_id:
+            raise HTTPException(
+                status_code=422,
+                detail="correction_of must not equal event_id",
+            )
+
+
+def create_events_batch(events: list[EventIn]) -> Tuple[list[EventOut], bool]:
+    """Atomically insert 1–100 immutable events in array order.
+
+    Contiguous revisions are allocated in array order inside one
+    ``BEGIN IMMEDIATE`` transaction; ``correction_of`` may target a stored
+    event or an *earlier* event of the same batch.
+
+    Returns (events_in_request_order, created):
+      * none of the ids stored yet, whole batch valid -> insert all, 201
+      * every id already stored with an identical payload      -> replay the
+        stored results in request order without new revisions, 200
+      * some ids missing, or any id stored with another payload -> 409
+
+    On any validation or write failure the transaction rolls back: no
+    events are stored and no revisions are consumed.
+    """
+    payloads = {ev.event_id: _canonical_payload(ev) for ev in events}
+
+    with write_tx() as conn:
+        # All validation and all writes happen inside this one BEGIN
+        # IMMEDIATE transaction: any failure rolls back, leaving no events
+        # and no consumed revisions.
+        _validate_batch_shape(events)
+        placeholders = ",".join("?" for _ in events)
+        existing = {
+            row["event_id"]: row
+            for row in conn.execute(
+                f"SELECT * FROM events WHERE event_id IN ({placeholders})",
+                [ev.event_id for ev in events],
+            ).fetchall()
+        }
+
+        if existing:
+            # A stored id with a different payload is a hard conflict; a mix
+            # of stored and new ids cannot replay atomically either.
+            for ev in events:
+                row = existing.get(ev.event_id)
+                if row is not None and row["payload"] != payloads[ev.event_id]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"event_id '{ev.event_id}' already exists with a "
+                            "different payload"
+                        ),
+                    )
+            if len(existing) != len(events):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "batch mixes already-stored and new event_ids; "
+                        "replay requires every event_id to be present with an "
+                        "identical payload"
+                    ),
+                )
+            return [_row_to_event(existing[ev.event_id]) for ev in events], False
+
+        # Every event is new: references must point at a stored event or an
+        # earlier batch entry — never at a later batch entry.
+        batch_index = {ev.event_id: i for i, ev in enumerate(events)}
+        external_targets = {
+            ev.correction_of
+            for ev in events
+            if ev.correction_of is not None
+            and ev.correction_of not in batch_index
+        }
+        if external_targets:
+            ext_placeholders = ",".join("?" for _ in external_targets)
+            known = {
+                r[0]
+                for r in conn.execute(
+                    f"SELECT event_id FROM events WHERE event_id IN "
+                    f"({ext_placeholders})",
+                    list(external_targets),
+                ).fetchall()
+            }
+            unknown = external_targets - known
+            if unknown:
+                target = next(iter(unknown))
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"correction_of references unknown event '{target}'",
+                )
+        for i, ev in enumerate(events):
+            target = ev.correction_of
+            if target is not None and target in batch_index and batch_index[target] > i:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"event '{ev.event_id}' references later batch event "
+                        f"'{target}'; corrections may only reference earlier "
+                        "batch events"
+                    ),
+                )
+
+        revision = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM events"
+        ).fetchone()[0]
+        created_at = (
+            datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        )
+        for ev in events:
+            conn.execute(
+                "INSERT INTO events (event_id, participant_id, points, correction_of, payload, revision, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ev.event_id,
+                    ev.participant_id,
+                    ev.points,
+                    ev.correction_of,
+                    payloads[ev.event_id],
+                    revision,
+                    created_at,
+                ),
+            )
+            revision += 1
+
+        rows = {
+            row["event_id"]: row
+            for row in conn.execute(
+                f"SELECT * FROM events WHERE event_id IN ({placeholders})",
+                [ev.event_id for ev in events],
+            ).fetchall()
+        }
+        return [_row_to_event(rows[ev.event_id]) for ev in events], True
+
+
 def create_event(ev: EventIn) -> Tuple[EventOut, bool]:
     """Insert an immutable event.
 
